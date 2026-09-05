@@ -1,0 +1,112 @@
+# Runs the esimplus bridge (Python) on a GitHub Actions runner, exposed
+# publicly through ngrok. Restarts every 5 hours; a new run auto-cancels
+# the previous one. No secrets live in this file — the ngrok token is read
+# from GitHub Actions secrets (NGROK_TOKEN).
+name: bridge-ngrok
+
+on:
+  schedule:
+    - cron: '0 */5 * * *' # every 5 hours (0, 5, 10, 15, 20 UTC)
+  workflow_dispatch: # manual trigger
+
+concurrency:
+  group: bridge-ngrok
+  cancel-in-progress: true # new run cancels the old one automatically
+
+jobs:
+  run:
+    runs-on: ubuntu-latest
+    timeout-minutes: 360 # GitHub Actions max job length
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      - name: Start bridge
+        run: |
+          python server.py > bridge.log 2>&1 &
+          for i in $(seq 1 20); do
+            if curl -sf http://127.0.0.1:8788/health > /dev/null; then
+              echo "bridge OK"
+              break
+            fi
+            sleep 1
+          done
+          curl -sf http://127.0.0.1:8788/health > /dev/null || { echo "bridge failed to start"; cat bridge.log; exit 1; }
+
+      - name: Install ngrok
+        run: |
+          curl -sSL https://ngrok-agent.s3.amazonaws.com/ngrok-v3-stable-linux-amd64.tgz -o ngrok.tgz
+          tar xzf ngrok.tgz
+          ./ngrok config add-authtoken "${{ secrets.NGROK_TOKEN }}"
+
+      - name: Start ngrok and capture public URL
+        run: |
+          ARGS="http 8788 --log stdout --log-format json"
+          if [ -n "${{ vars.NGROK_DOMAIN }}" ]; then
+            ARGS="$ARGS --url ${{ vars.NGROK_DOMAIN }}"
+          fi
+          ./ngrok $ARGS > ngrok.log 2>&1 &
+          URL=""
+          for i in $(seq 1 45); do
+            URL=$(python - <<'PY'
+import json
+url = ""
+try:
+    with open("ngrok.log") as f:
+        for line in f:
+            try:
+                d = json.loads(line)
+                if d.get("msg") == "started tunnel" and d.get("tunnel", {}).get("url"):
+                    url = d["tunnel"]["url"]
+                    break
+            except Exception:
+                pass
+except Exception:
+    pass
+print(url)
+PY
+)
+            if [ -n "$URL" ]; then break; fi
+            sleep 2
+          done
+          if [ -z "$URL" ]; then echo "ngrok failed"; tail -30 ngrok.log; exit 1; fi
+          echo "NGROK_URL=$URL" >> "$GITHUB_ENV"
+          echo "PUBLIC_URL=$URL"
+
+      - name: Publish URL to repo (ngrok-url.txt)
+        run: |
+          echo "$NGROK_URL" > ngrok-url.txt
+          git config user.email "actions@github.com"
+          git config user.name "github-actions[bot]"
+          git add ngrok-url.txt
+          git diff --cached --quiet || { git commit -m "update ngrok url [skip ci]" && git push; }
+
+      - name: Update Cloudflare worker BRIDGE_URL secrets (optional)
+        if: vars.CF_ACCOUNT_ID != ''
+        env:
+          CF_API_TOKEN: ${{ secrets.CF_API_TOKEN }}
+          CF_ACCOUNT_ID: ${{ vars.CF_ACCOUNT_ID }}
+        run: |
+          if [ -z "$CF_API_TOKEN" ]; then
+            echo "CF_API_TOKEN secret not set — skipping worker update"
+            exit 0
+          fi
+          for worker in pulse-admin pulse-client; do
+            status=$(curl -s -o /dev/null -w "%{http_code}" -X PUT \
+              "https://api.cloudflare.com/client/v4/accounts/$CF_ACCOUNT_ID/workers/scripts/$worker/secrets" \
+              -H "Authorization: Bearer $CF_API_TOKEN" \
+              -H "Content-Type: application/json" \
+              -d "{\"name\":\"BRIDGE_URL\",\"text\":\"$NGROK_URL\"}")
+            echo "$worker: HTTP $status"
+          done
+
+      - name: Keep alive (until next run cancels this one)
+        run: |
+          echo "bridge live at $NGROK_URL — next scheduled run will cancel this job"
+          sleep 19000 # ~5h16m; the 5h cron cancels it via concurrency
