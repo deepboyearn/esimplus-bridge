@@ -92,4 +92,4 @@ jobs:
       - name: Keep alive (until next run cancels this one)
         run: |
           echo "bridge live at $NGROK_URL — next scheduled run will cancel this job"
-          sleep 17000
+          sleep 20100
