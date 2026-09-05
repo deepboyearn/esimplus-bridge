@@ -16,7 +16,7 @@ concurrency:
 jobs:
   run:
     runs-on: ubuntu-latest
-    timeout-minutes: 360 # GitHub Actions max job length
+    timeout-minutes: 350
     steps:
       - uses: actions/checkout@v4
 
@@ -54,24 +54,7 @@ jobs:
           ./ngrok $ARGS > ngrok.log 2>&1 &
           URL=""
           for i in $(seq 1 45); do
-            URL=$(python - <<'PY'
-import json
-url = ""
-try:
-    with open("ngrok.log") as f:
-        for line in f:
-            try:
-                d = json.loads(line)
-                if d.get("msg") == "started tunnel" and d.get("tunnel", {}).get("url"):
-                    url = d["tunnel"]["url"]
-                    break
-            except Exception:
-                pass
-except Exception:
-    pass
-print(url)
-PY
-)
+            URL=$(grep -o '"url":"https://[^"]*"' ngrok.log | head -1 | sed 's/"url":"//; s/"//')
             if [ -n "$URL" ]; then break; fi
             sleep 2
           done
@@ -109,4 +92,4 @@ PY
       - name: Keep alive (until next run cancels this one)
         run: |
           echo "bridge live at $NGROK_URL — next scheduled run will cancel this job"
-          sleep 19000 # ~5h16m; the 5h cron cancels it via concurrency
+          sleep 17000
